@@ -1,25 +1,31 @@
 # GitHub to Linear Sync
 
-A Node.js application that syncs issues from the WordPress Gutenberg repository to Linear.
+A Node.js application that syncs issues from a public GitHub repository to Linear.
 
-## Current Status: Step 3 - Comment Syncing
 
-Syncs open GitHub issues from WordPress/gutenberg to Linear with automated tracking and continuous comment synchronization.
+## Features
 
-### Features Implemented
-- Fetches **open issues only** from WordPress/gutenberg with configurable labels (AND logic)
-- Creates issues in Linear with GitHub metadata embedded in description
-- **Syncs comments continuously**:
-  - All comments copied when creating new issues
-  - New comments automatically synced to existing issues on each poll
-  - Preserves author info and links back to GitHub
-- Tracks synced issues using a configurable Linear label
-- Prevents duplicate syncing by checking existing Linear issues and comments
-- Retrieves issue details including:
-  - Title, description
-  - All comments with authors, timestamps, and GitHub links
-  - Associated PRs (using GitHub's Timeline API)
-- Polls GitHub at configurable intervals for continuous sync
+### Core Functionality
+- **Issue Syncing**: Fetches open issues with configurable labels (AND logic)
+- **Comment Syncing**: Continuously syncs all comments with author info and timestamps
+- **Status Transitions**: Automatically updates Linear issue states based on GitHub activity:
+  - **"In Review"** when issue has an open PR
+  - **"Done"** when GitHub issue is closed
+- **PR Association**: Tracks associated PRs using GitHub's Timeline API
+- **Label-based Tracking**: Uses Linear labels to track synced issues
+- **Idempotent Operations**: Prevents duplicate issues/comments on retries
+
+### Reliability & Performance
+- **Parallel Batching**: Processes multiple issues concurrently (5 at a time)
+- **Retry Logic**: Automatic retries with exponential backoff and rate limit respect
+- **Race Condition Protection**: Uses proper mutex locking for concurrent sync prevention
+- **Fault Tolerance**: Continues syncing even if individual issues fail
+- **API Pagination**: Handles repositories with 100+ issues, comments, or timeline events
+
+### Security
+- **Token Validation**: Validates GitHub and Linear tokens at startup
+- **Secrets Protection**: Checks for .gitignore to prevent accidental secret commits
+- **Sanitized Errors**: Error messages never expose sensitive token information
 
 ## GitHub Token Setup
 
@@ -50,13 +56,6 @@ You need a GitHub Personal Access Token to use this app. **Fine-grained tokens a
 - **No write access needed**: The token only needs read permissions since we're querying public data from WordPress/gutenberg.
 - **You don't need repo admin access**: Anyone can create a personal token with read-only access to public repositories.
 
-### Alternative: Classic Token
-
-If you prefer, you can use a classic token:
-- Go to [GitHub Settings > Personal Access Tokens (classic)](https://github.com/settings/tokens)
-- Select **no scopes** (or just `public_repo` for clarity)
-- Classic tokens have broader access, so fine-grained tokens are more secure
-
 ## Linear API Setup
 
 You need a Linear API key to sync issues to your Linear workspace.
@@ -72,7 +71,7 @@ You need a Linear API key to sync issues to your Linear workspace.
 4. Copy the API key immediately (it won't be shown again)
 
 5. Find your **Team ID** (UUID format):
-Locate the IDs of teams, issues and other entities directly within Linear itself from the command menu: Cmd/Ctrl+K and "Copy model UUID". This will show results based on the page you're currently viewing within Linear.
+ - Locate the IDs your team within Linear itself from the command menu: Cmd/Ctrl+K and "Copy model UUID". This will show results based on the page you're currently viewing within Linear.
 
 6. Add both to your `.env` file
 
@@ -90,22 +89,28 @@ npm install
 cp .env.example .env
 ```
 
-4. Configure `.env`:
+4. Configure `.env` with your settings:
 ```env
 # GitHub
 GITHUB_REPO_OWNER=WordPress
 GITHUB_REPO_NAME=gutenberg
 GITHUB_TOKEN=github_pat_xxxxx
-GITHUB_LABELS=[Feature] Real-time Collaboration
+GITHUB_LABELS=label1,label2  # AND logic - issues must have ALL labels
 
 # Linear
 LINEAR_API_KEY=lin_api_xxxxx
 LINEAR_TEAM_ID=a1b2c3d4-e5f6-...  # UUID, not team name
 LINEAR_SYNC_LABEL=github-sync
 
+# Linear workflow states for status transitions
+LINEAR_STATE_IN_REVIEW=In Review  # State when issue has open PR
+LINEAR_STATE_DONE=Done            # State when GitHub issue is closed
+
 # Polling
 POLL_INTERVAL_MINUTES=5
 ```
+
+**Note**: The state names must match your Linear team's workflow states exactly (case-insensitive).
 
 ## Usage
 
@@ -126,7 +131,8 @@ The sync will:
 - Run immediately on startup
 - Poll GitHub at the configured interval
 - Create new Linear issues for unsynced GitHub issues
-- Sync comments continuously
+- Sync comments continuously for all issues
+- Update Linear issue states based on GitHub activity
 
 ## How It Works
 
@@ -173,12 +179,22 @@ Comments are tracked using embedded metadata similar to issues:
    - No duplicate comments
    - Full comment history preserved
 
-## Next Steps
+### Status Transitions
 
-- **Step 4**: Handle status changes (Triage → In Review → Done)
+The app automatically updates Linear issue states based on GitHub activity:
 
-## Label Logic
+1. **Transition Rules (in priority order):**
+   - If GitHub issue is **closed** → Linear state = "Done"
+   - Else if issue has **open, non-draft PR** → Linear state = "In Review"
+   - Otherwise → No state change
 
-Issues must have **ALL** specified labels to be synced (AND logic).
+2. **How it works:**
+   - Uses GitHub Timeline API to detect associated PRs
+   - Fetches full PR details (state, merged status, draft status)
+   - Checks current Linear state before updating (avoids unnecessary API calls)
+   - State names are configurable via environment variables
 
-Example: If `GITHUB_LABELS=sync-to-linear,bug`, only issues with both labels will be synced.
+3. **Customization:**
+   - Set `LINEAR_STATE_IN_REVIEW` to match your team's "in progress" state
+   - Set `LINEAR_STATE_DONE` to match your team's "completed" state
+   - State matching is case-insensitive

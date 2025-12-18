@@ -1,4 +1,6 @@
 import * as dotenv from 'dotenv';
+import * as fs from 'fs';
+import * as path from 'path';
 
 dotenv.config();
 
@@ -32,7 +34,7 @@ function getRequiredEnv(key: string): string {
 function validateGitHubToken(token: string): void {
   // GitHub tokens start with ghp_ (classic) or github_pat_ (fine-grained)
   if (!token.startsWith('ghp_') && !token.startsWith('github_pat_')) {
-    throw new Error('GITHUB_TOKEN appears invalid (should start with ghp_ or github_pat_)');
+    throw new Error('GITHUB_TOKEN appears invalid. Please use a valid GitHub Personal Access Token from https://github.com/settings/tokens');
   }
 }
 
@@ -47,12 +49,30 @@ function validateLinearTeamId(teamId: string): void {
 function validatePollInterval(intervalString: string): number {
   const interval = parseInt(intervalString, 10);
   if (isNaN(interval) || interval <= 0) {
-    throw new Error(`POLL_INTERVAL_MINUTES must be a positive number, got: "${intervalString}"`);
+    throw new Error('POLL_INTERVAL_MINUTES must be a positive number');
   }
   return interval;
 }
 
+function validateGitIgnore(): void {
+  const gitignorePath = path.join(process.cwd(), '.gitignore');
+
+  if (!fs.existsSync(gitignorePath)) {
+    console.warn('WARNING: .gitignore file not found! Environment variables may be committed to git.');
+    return;
+  }
+
+  const gitignoreContent = fs.readFileSync(gitignorePath, 'utf-8');
+
+  if (!gitignoreContent.includes('.env')) {
+    console.warn('WARNING: .gitignore does not contain .env! Secrets may be committed to git.');
+  }
+}
+
 export function loadConfig(): Config {
+  // Validate .gitignore exists and contains .env
+  validateGitIgnore();
+
   const labelsString = getRequiredEnv('GITHUB_LABELS');
   const labels = labelsString
     .split(',')

@@ -2,6 +2,8 @@ import { loadConfig } from './config.js';
 import { GitHubService } from './github.js';
 import { LinearService } from './linear.js';
 import { Logger } from './logger.js';
+import { Mutex } from 'async-mutex';
+import type { SyncData } from './types.js';
 
 async function sync(): Promise<void> {
   try {
@@ -18,11 +20,20 @@ async function sync(): Promise<void> {
       return;
     }
 
-    // Fetch complete sync data for each issue
+    // Fetch complete sync data for each issue (use allSettled to continue even if some fail)
     console.log(`\nFetching details for ${issues.length} issue(s)...`);
-    const syncData = await Promise.all(
+    const syncDataResults = await Promise.allSettled(
       issues.map(issue => githubService.fetchIssueSyncData(issue))
     );
+
+    const syncData = syncDataResults
+      .filter((r): r is PromiseFulfilledResult<SyncData> => r.status === 'fulfilled')
+      .map(r => r.value);
+
+    const failedFetches = syncDataResults.filter(r => r.status === 'rejected');
+    if (failedFetches.length > 0) {
+      console.warn(`Warning: Failed to fetch details for ${failedFetches.length} issue(s)`);
+    }
 
     // Fetch existing Linear issues
     console.log('\nFetching existing Linear issues...');
@@ -40,22 +51,49 @@ async function sync(): Promise<void> {
 
     console.log(`\n${issuesToCreate.length} new issue(s) to sync to Linear`);
 
-    // Create new issues in Linear and sync comments
+    // Create new issues in Linear and sync comments (with parallel batching)
+    const BATCH_SIZE = 5; // Process 5 issues at a time to avoid overwhelming APIs
     let createdCount = 0;
 
-    for (const data of issuesToCreate) {
-      console.log(`\nCreating Linear issue for GitHub #${data.issue.number}: ${data.issue.title}`);
-      const linearIssue = await linearService.createIssue(data.issue);
-      console.log(`✓ Created: ${linearIssue.identifier}`);
+    for (let i = 0; i < issuesToCreate.length; i += BATCH_SIZE) {
+      const batch = issuesToCreate.slice(i, i + BATCH_SIZE);
+      console.log(`\nProcessing batch ${Math.floor(i / BATCH_SIZE) + 1} (${batch.length} issue(s))...`);
 
-      // Sync all comments for new issue
-      if (data.comments.length > 0) {
-        console.log(`  Syncing ${data.comments.length} comment(s)...`);
-        const syncedCount = await linearService.syncComments(linearIssue.id, data.comments);
-        console.log(`  ✓ Synced ${syncedCount} comment(s)`);
-      }
+      // Process batch in parallel using Promise.allSettled
+      const results = await Promise.allSettled(
+        batch.map(async (data) => {
+          let linearIssue: any = null;
 
-      createdCount++;
+          try {
+            console.log(`  Creating Linear issue for GitHub #${data.issue.number}: ${data.issue.title}`);
+            linearIssue = await linearService.createIssue(data.issue);
+            console.log(`  ✓ Created: ${linearIssue.identifier}`);
+
+            // Sync all comments for new issue
+            if (data.comments.length > 0) {
+              console.log(`    Syncing ${data.comments.length} comment(s)...`);
+              const syncedCount = await linearService.syncComments(linearIssue.id, data.comments);
+              console.log(`    ✓ Synced ${syncedCount} comment(s)`);
+            }
+
+            return { success: true, issue: linearIssue };
+          } catch (error) {
+            // Transaction compensation: if comment syncing failed after issue creation
+            if (linearIssue) {
+              console.error(`  ✗ Failed to sync comments for ${linearIssue.identifier}:`, error);
+              console.error(`    Issue was created but comments failed. Manual review may be needed.`);
+            } else {
+              console.error(`  ✗ Failed to create issue for GitHub #${data.issue.number}:`, error);
+            }
+            return { success: false, error };
+          }
+        })
+      );
+
+      // Count successful creations
+      createdCount += results.filter(
+        (r) => r.status === 'fulfilled' && r.value.success
+      ).length;
     }
 
     // Sync comments for existing issues
@@ -124,7 +162,7 @@ async function sync(): Promise<void> {
 async function startPolling(): Promise<void> {
   const config = loadConfig();
   const intervalMs = config.polling.intervalMinutes * 60 * 1000;
-  let syncInProgress = false;
+  const syncMutex = new Mutex();
 
   console.log('Starting GitHub -> Linear Sync');
   console.log('='.repeat(80));
@@ -140,19 +178,19 @@ async function startPolling(): Promise<void> {
 
   // Then poll at configured interval
   const interval = setInterval(async () => {
-    // Skip if previous sync is still running
-    if (syncInProgress) {
+    // Try to acquire lock, skip if previous sync is still running
+    if (syncMutex.isLocked()) {
       console.log('\nSkipping sync - previous sync still in progress');
       return;
     }
 
-    syncInProgress = true;
+    const release = await syncMutex.acquire();
     try {
       await sync();
     } catch (error) {
       console.error('Error during sync:', error);
     } finally {
-      syncInProgress = false;
+      release();
     }
   }, intervalMs);
 

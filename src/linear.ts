@@ -110,9 +110,25 @@ export class LinearService {
   }
 
   /**
+   * Finds a Linear issue by GitHub issue number (idempotency check)
+   */
+  async findIssueByGitHubNumber(githubIssueNumber: number): Promise<LinearIssueData | undefined> {
+    const syncedIssues = await this.fetchSyncedIssues();
+    return syncedIssues.find(issue => issue.githubIssueNumber === githubIssueNumber);
+  }
+
+  /**
    * Creates a new issue in Linear with GitHub metadata
+   * Implements idempotency: returns existing issue if already synced
    */
   async createIssue(githubIssue: GitHubIssue): Promise<LinearIssueData> {
+    // Idempotency check: see if issue already exists
+    const existing = await this.findIssueByGitHubNumber(githubIssue.number);
+    if (existing) {
+      console.log(`  Issue already exists: ${existing.identifier}`);
+      return existing;
+    }
+
     const labelId = await this.getOrCreateSyncLabel();
     const { teamId } = this.config.linear;
 

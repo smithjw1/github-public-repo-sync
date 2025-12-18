@@ -30,8 +30,8 @@ function isRetryableError(error: any): boolean {
   // HTTP status codes that are retryable
   if (error.status) {
     const status = error.status;
-    // 429 Too Many Requests, 500-599 Server Errors
-    if (status === 429 || (status >= 500 && status < 600)) {
+    // 429 Too Many Requests, 403 Forbidden (rate limit), 500-599 Server Errors
+    if (status === 429 || status === 403 || (status >= 500 && status < 600)) {
       return true;
     }
   }
@@ -50,6 +50,37 @@ function isRetryableError(error: any): boolean {
   }
 
   return false;
+}
+
+/**
+ * Extracts Retry-After value from error response
+ * Returns delay in milliseconds, or null if not found
+ */
+function getRetryAfterMs(error: any): number | null {
+  // Check for Retry-After header in various possible locations
+  const retryAfter =
+    error.response?.headers?.['retry-after'] ||
+    error.headers?.['retry-after'] ||
+    error.response?.headers?.['Retry-After'] ||
+    error.headers?.['Retry-After'];
+
+  if (!retryAfter) {
+    return null;
+  }
+
+  // Retry-After can be either a number (seconds) or an HTTP date
+  const parsed = parseInt(retryAfter, 10);
+  if (!isNaN(parsed)) {
+    return parsed * 1000; // Convert seconds to milliseconds
+  }
+
+  // Try parsing as date
+  const retryDate = new Date(retryAfter);
+  if (!isNaN(retryDate.getTime())) {
+    return Math.max(0, retryDate.getTime() - Date.now());
+  }
+
+  return null;
 }
 
 /**
@@ -85,17 +116,28 @@ export async function retry<T>(
         throw error;
       }
 
-      // Calculate delay with exponential backoff
-      const delayMs = Math.min(
-        config.initialDelayMs * Math.pow(config.backoffMultiplier, attempt - 1),
-        config.maxDelayMs
-      );
+      // Check for Retry-After header (rate limiting)
+      const retryAfterMs = getRetryAfterMs(error);
+      let delayMs: number;
 
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      console.warn(
-        `API call failed (attempt ${attempt}/${config.maxAttempts}), retrying in ${delayMs}ms...`,
-        errorMessage
-      );
+      if (retryAfterMs !== null) {
+        // Respect Retry-After header, but cap at maxDelayMs
+        delayMs = Math.min(retryAfterMs, config.maxDelayMs);
+        console.warn(
+          `Rate limited (attempt ${attempt}/${config.maxAttempts}). Waiting ${delayMs}ms as requested by server...`
+        );
+      } else {
+        // Use exponential backoff
+        delayMs = Math.min(
+          config.initialDelayMs * Math.pow(config.backoffMultiplier, attempt - 1),
+          config.maxDelayMs
+        );
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        console.warn(
+          `API call failed (attempt ${attempt}/${config.maxAttempts}), retrying in ${delayMs}ms...`,
+          errorMessage
+        );
+      }
 
       await delay(delayMs);
     }

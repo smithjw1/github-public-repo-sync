@@ -106,8 +106,9 @@ LINEAR_SYNC_LABEL=github-sync
 LINEAR_STATE_IN_REVIEW=In Review  # State when issue has open PR
 LINEAR_STATE_DONE=Done            # State when GitHub issue is closed
 
-# Polling
-POLL_INTERVAL_MINUTES=5
+# Polling (with exponential backoff)
+POLL_MIN_INTERVAL_MINUTES=5
+POLL_MAX_INTERVAL_MINUTES=60
 ```
 
 **Note**: The state names must match your Linear team's workflow states exactly (case-insensitive).
@@ -129,7 +130,7 @@ npm start
 
 The sync will:
 - Run immediately on startup
-- Poll GitHub at the configured interval
+- Poll GitHub with exponential backoff (starts at minimum interval, backs off to maximum when no new issues found)
 - Create new Linear issues for unsynced GitHub issues
 - Sync comments continuously for all issues
 - Update Linear issue states based on GitHub activity

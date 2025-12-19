@@ -19,7 +19,8 @@ export interface Config {
     stateDone: string;
   };
   polling: {
-    intervalMinutes: number;
+    minIntervalMinutes: number;
+    maxIntervalMinutes: number;
   };
 }
 
@@ -46,12 +47,18 @@ function validateLinearTeamId(teamId: string): void {
   }
 }
 
-function validatePollInterval(intervalString: string): number {
+function validatePollInterval(intervalString: string, fieldName: string): number {
   const interval = parseInt(intervalString, 10);
   if (isNaN(interval) || interval <= 0) {
-    throw new Error('POLL_INTERVAL_MINUTES must be a positive number');
+    throw new Error(`${fieldName} must be a positive number`);
   }
   return interval;
+}
+
+function validatePollIntervals(minInterval: number, maxInterval: number): void {
+  if (minInterval > maxInterval) {
+    throw new Error('POLL_MIN_INTERVAL_MINUTES must be less than or equal to POLL_MAX_INTERVAL_MINUTES');
+  }
 }
 
 function validateGitIgnore(): void {
@@ -89,7 +96,9 @@ export function loadConfig(): Config {
   const linearTeamId = getRequiredEnv('LINEAR_TEAM_ID');
   validateLinearTeamId(linearTeamId);
 
-  const pollInterval = validatePollInterval(getRequiredEnv('POLL_INTERVAL_MINUTES'));
+  const minInterval = validatePollInterval(getRequiredEnv('POLL_MIN_INTERVAL_MINUTES'), 'POLL_MIN_INTERVAL_MINUTES');
+  const maxInterval = validatePollInterval(getRequiredEnv('POLL_MAX_INTERVAL_MINUTES'), 'POLL_MAX_INTERVAL_MINUTES');
+  validatePollIntervals(minInterval, maxInterval);
 
   return {
     github: {
@@ -106,7 +115,8 @@ export function loadConfig(): Config {
       stateDone: process.env.LINEAR_STATE_DONE || 'Done',
     },
     polling: {
-      intervalMinutes: pollInterval,
+      minIntervalMinutes: minInterval,
+      maxIntervalMinutes: maxInterval,
     },
   };
 }

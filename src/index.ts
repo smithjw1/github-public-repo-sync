@@ -5,7 +5,11 @@ import { Logger } from './logger.js';
 import { Mutex } from 'async-mutex';
 import type { SyncData } from './types.js';
 
-async function sync(): Promise<void> {
+interface SyncResult {
+  newIssuesFound: boolean;
+}
+
+async function sync(): Promise<SyncResult> {
   try {
     const config = loadConfig();
     const githubService = new GitHubService(config);
@@ -17,7 +21,7 @@ async function sync(): Promise<void> {
 
     if (issues.length === 0) {
       console.log('\nNo GitHub issues found matching the specified labels.');
-      return;
+      return { newIssuesFound: false };
     }
 
     // Fetch complete sync data for each issue (use allSettled to continue even if some fail)
@@ -153,6 +157,8 @@ async function sync(): Promise<void> {
     logger.logSummary(syncData);
 
     console.log(`\nSync complete: ${createdCount} issue(s) created, ${stateChangedCount} state(s) updated`);
+
+    return { newIssuesFound: createdCount > 0 };
   } catch (error) {
     console.error('Error during sync:', error);
     throw error;
@@ -161,8 +167,13 @@ async function sync(): Promise<void> {
 
 async function startPolling(): Promise<void> {
   const config = loadConfig();
-  const intervalMs = config.polling.intervalMinutes * 60 * 1000;
   const syncMutex = new Mutex();
+
+  // Backoff state
+  let currentIntervalMinutes = config.polling.minIntervalMinutes;
+  let consecutiveEmptySyncs = 0;
+  let timeoutHandle: NodeJS.Timeout | null = null;
+  let isShuttingDown = false;
 
   console.log('Starting GitHub -> Linear Sync');
   console.log('='.repeat(80));
@@ -170,42 +181,83 @@ async function startPolling(): Promise<void> {
   console.log(`Labels (AND): ${config.github.labels.join(', ')}`);
   console.log(`Linear Team: ${config.linear.teamId}`);
   console.log(`Sync Label: ${config.linear.syncLabel}`);
-  console.log(`Poll interval: ${config.polling.intervalMinutes} minute(s)`);
+  console.log(`Poll interval: ${config.polling.minIntervalMinutes}-${config.polling.maxIntervalMinutes} minute(s) (with backoff)`);
   console.log('='.repeat(80));
 
+  const scheduleNextSync = () => {
+    if (isShuttingDown) return;
+
+    const intervalMs = currentIntervalMinutes * 60 * 1000;
+    console.log(`\nNext sync scheduled in ${currentIntervalMinutes} minute(s)...`);
+
+    timeoutHandle = setTimeout(async () => {
+      // Try to acquire lock, skip if previous sync is still running
+      if (syncMutex.isLocked()) {
+        console.log('\nSkipping sync - previous sync still in progress');
+        scheduleNextSync();
+        return;
+      }
+
+      const release = await syncMutex.acquire();
+      try {
+        const result = await sync();
+
+        if (result.newIssuesFound) {
+          // Reset backoff when new issues are found
+          consecutiveEmptySyncs = 0;
+          currentIntervalMinutes = config.polling.minIntervalMinutes;
+          console.log(`New issues found - reset poll interval to ${currentIntervalMinutes} minute(s)`);
+        } else {
+          // Increment empty sync counter and apply backoff
+          consecutiveEmptySyncs++;
+
+          if (consecutiveEmptySyncs >= 2) {
+            // Double the interval (exponential backoff), but cap at max
+            const newInterval = Math.min(
+              currentIntervalMinutes * 2,
+              config.polling.maxIntervalMinutes
+            );
+
+            if (newInterval !== currentIntervalMinutes) {
+              currentIntervalMinutes = newInterval;
+              console.log(`No new issues for ${consecutiveEmptySyncs} consecutive syncs - increasing interval to ${currentIntervalMinutes} minute(s)`);
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Error during sync:', error);
+      } finally {
+        release();
+        scheduleNextSync();
+      }
+    }, intervalMs);
+  };
+
   // Run immediately on start
-  await sync();
-
-  // Then poll at configured interval
-  const interval = setInterval(async () => {
-    // Try to acquire lock, skip if previous sync is still running
-    if (syncMutex.isLocked()) {
-      console.log('\nSkipping sync - previous sync still in progress');
-      return;
+  try {
+    const result = await sync();
+    if (!result.newIssuesFound) {
+      consecutiveEmptySyncs = 1;
     }
+  } catch (error) {
+    console.error('Error during initial sync:', error);
+  }
 
-    const release = await syncMutex.acquire();
-    try {
-      await sync();
-    } catch (error) {
-      console.error('Error during sync:', error);
-    } finally {
-      release();
-    }
-  }, intervalMs);
+  // Schedule the next sync
+  scheduleNextSync();
 
   // Graceful shutdown
-  process.on('SIGINT', () => {
+  const shutdown = () => {
     console.log('\n\nShutting down gracefully...');
-    clearInterval(interval);
+    isShuttingDown = true;
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
     process.exit(0);
-  });
+  };
 
-  process.on('SIGTERM', () => {
-    console.log('\n\nShutting down gracefully...');
-    clearInterval(interval);
-    process.exit(0);
-  });
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
 // Start the application

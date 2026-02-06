@@ -135,6 +135,22 @@ The sync will:
 - Sync comments continuously for all issues
 - Update Linear issue states based on GitHub activity
 
+### Create a GitHub issue from a Linear issue
+
+To kick off a sync in the other direction — start from an existing Linear issue and create the corresponding GitHub issue — use the `create` command:
+
+```bash
+npm run create -- https://linear.app/a8c/issue/VIP-1553/design-connection-status-ui
+```
+
+The `--` is required by npm to forward the URL argument to the script.
+
+This will:
+1. Fetch the Linear issue title and description
+2. Create a GitHub issue with that content, a back-link to the Linear issue, and the configured labels (so the poll loop picks it up)
+3. Stamp the original Linear issue with a `**GitHub Issue:** #N` link so the next poll cycle recognises it as already synced and skips duplicate creation
+4. Open the new GitHub issue in your browser
+
 ## How It Works
 
 ### Issue Tracking

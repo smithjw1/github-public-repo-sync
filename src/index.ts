@@ -1,3 +1,4 @@
+import { execSync } from 'child_process';
 import { loadConfig } from './config.js';
 import { GitHubService } from './github.js';
 import { LinearService } from './linear.js';
@@ -260,8 +261,89 @@ async function startPolling(): Promise<void> {
   process.on('SIGTERM', shutdown);
 }
 
-// Start the application
-startPolling().catch(error => {
-  console.error('Fatal error:', error);
-  process.exit(1);
-});
+/**
+ * Parses a Linear issue URL and extracts the identifier.
+ * Supports: https://linear.app/{org}/issue/{IDENTIFIER}/{slug}
+ */
+function parseLinearUrl(url: string): string {
+  const match = url.match(/linear\.app\/[^/]+\/issue\/([A-Z]+-\d+)/);
+  if (!match || !match[1]) {
+    throw new Error(`Could not parse Linear issue identifier from URL: ${url}`);
+  }
+  return match[1];
+}
+
+/**
+ * Creates a GitHub issue from a Linear issue, then stamps the Linear
+ * issue with the GitHub back-link so the sync loop doesn't duplicate it.
+ */
+async function createFromLinear(linearUrl: string): Promise<void> {
+  const config = loadConfig();
+  const githubService = new GitHubService(config);
+  const linearService = new LinearService(config);
+
+  // Parse identifier from URL
+  const identifier = parseLinearUrl(linearUrl);
+  console.log(`Parsed Linear identifier: ${identifier}`);
+
+  // Fetch the Linear issue
+  console.log(`Fetching Linear issue ${identifier}...`);
+  const linearIssue = await linearService.fetchIssueByIdentifier(identifier);
+  if (!linearIssue) {
+    throw new Error(`Linear issue ${identifier} not found`);
+  }
+  console.log(`Found: ${linearIssue.title}`);
+
+  // Format GitHub issue body: Linear description + metadata footer
+  const body = [
+    linearIssue.description || '(No description)',
+    '',
+    '---',
+    `**Linear Issue:** ${identifier}`,
+    `**Linear URL:** ${linearUrl}`,
+  ].join('\n');
+
+  // Create GitHub issue with the configured labels so the poll picks it up
+  console.log(`Creating GitHub issue in ${config.github.owner}/${config.github.repo} with labels: ${config.github.labels.join(', ')}...`);
+  const ghIssue = await githubService.createIssue({
+    title: linearIssue.title,
+    body,
+    labels: config.github.labels,
+  });
+  console.log(`Created GitHub issue #${ghIssue.number}: ${ghIssue.html_url}`);
+
+  // Stamp the Linear issue with GitHub metadata so the sync loop
+  // recognizes it as already synced and skips duplicate creation.
+  const updatedDescription = [
+    linearIssue.description || '',
+    '',
+    '---',
+    `**GitHub Issue:** #${ghIssue.number}`,
+    `**GitHub URL:** ${ghIssue.html_url}`,
+  ].join('\n');
+
+  console.log(`Updating Linear issue ${identifier} with GitHub link...`);
+  await linearService.updateIssueDescription(linearIssue.id, updatedDescription);
+  console.log(`Done. ${identifier} <-> GitHub #${ghIssue.number}`);
+
+  // Open the new issue in the browser
+  try {
+    execSync(`open ${ghIssue.html_url}`);
+  } catch {
+    // Non-fatal: skip if open isn't available
+  }
+}
+
+// Entry point: `create <linear-url>` or default polling mode
+const args = process.argv.slice(2);
+if (args[0] === 'create' && args[1]) {
+  createFromLinear(args[1]).catch(error => {
+    console.error('Fatal error:', error);
+    process.exit(1);
+  });
+} else {
+  startPolling().catch(error => {
+    console.error('Fatal error:', error);
+    process.exit(1);
+  });
+}

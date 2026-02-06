@@ -25,6 +25,24 @@ export class LinearService {
   }
 
   /**
+   * Fetches the sync label by name using a server-side filtered query.
+   * This avoids the default-page-size limit that team.labels() has when
+   * iterating in memory.
+   */
+  private async findSyncLabel(): Promise<IssueLabel | undefined> {
+    const { teamId, syncLabel } = this.config.linear;
+    const result = await retry(() =>
+      this.client.issueLabels({
+        filter: {
+          team: { id: { eq: teamId } },
+          name: { eq: syncLabel },
+        },
+      })
+    );
+    return result.nodes[0];
+  }
+
+  /**
    * Gets or creates the sync label in Linear
    */
   async getOrCreateSyncLabel(): Promise<string> {
@@ -34,13 +52,8 @@ export class LinearService {
 
     const { teamId, syncLabel } = this.config.linear;
 
-    // Try to find existing label
-    const team = await retry(() => this.client.team(teamId));
-    const labels = await retry(() => team.labels());
-
-    const existingLabel = labels.nodes.find(
-      (label: IssueLabel) => label.name === syncLabel
-    );
+    // Try to find existing label via filtered API query
+    const existingLabel = await this.findSyncLabel();
 
     if (existingLabel) {
       this.syncLabelId = existingLabel.id;
@@ -48,23 +61,40 @@ export class LinearService {
       return existingLabel.id;
     }
 
-    // Create new label
-    const labelPayload = await retry(() =>
-      this.client.createIssueLabel({
-        name: syncLabel,
-        teamId,
-        color: '#5E6AD2', // Linear blue
-      })
-    );
+    // Create new label, handling the race where another sync cycle
+    // created it between our read and this write.
+    try {
+      const labelPayload = await retry(() =>
+        this.client.createIssueLabel({
+          name: syncLabel,
+          teamId,
+          color: '#5E6AD2', // Linear blue
+        })
+      );
 
-    const newLabel = await labelPayload.issueLabel;
-    if (!newLabel) {
-      throw new Error(`Failed to create sync label: ${syncLabel}`);
+      const newLabel = await labelPayload.issueLabel;
+      if (!newLabel) {
+        throw new Error(`Failed to create sync label: ${syncLabel}`);
+      }
+
+      this.syncLabelId = newLabel.id;
+      console.log(`Created sync label: "${syncLabel}" (${newLabel.id})`);
+      return newLabel.id;
+    } catch (error: unknown) {
+      // If the label was created by a concurrent sync between our check and
+      // this mutation, re-fetch and return the existing one.
+      const isDuplicate =
+        error instanceof Error && error.message.includes('already exists');
+      if (isDuplicate) {
+        const label = await this.findSyncLabel();
+        if (label) {
+          this.syncLabelId = label.id;
+          console.log(`Using existing sync label (race resolved): "${syncLabel}" (${label.id})`);
+          return label.id;
+        }
+      }
+      throw error;
     }
-
-    this.syncLabelId = newLabel.id;
-    console.log(`Created sync label: "${syncLabel}" (${newLabel.id})`);
-    return newLabel.id;
   }
 
   /**
@@ -373,5 +403,31 @@ export class LinearService {
       console.error(`Failed to sync state for issue ${linearIssueId}:`, error);
       return false;
     }
+  }
+
+  /**
+   * Fetches a Linear issue by its identifier (e.g., "VIP-1553").
+   * Linear's API accepts identifiers in place of UUIDs.
+   */
+  async fetchIssueByIdentifier(identifier: string): Promise<{ id: string; title: string; description: string | null } | undefined> {
+    try {
+      const issue = await retry(() => this.client.issue(identifier));
+      return {
+        id: issue.id,
+        title: issue.title,
+        description: issue.description ?? null,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Updates a Linear issue's description
+   */
+  async updateIssueDescription(issueId: string, description: string): Promise<void> {
+    await retry(() =>
+      this.client.updateIssue(issueId, { description })
+    );
   }
 }

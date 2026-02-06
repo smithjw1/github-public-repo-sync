@@ -35,8 +35,10 @@ export class GitHubService {
       })
     );
 
-    // Filter to only include issues that have ALL required labels
+    // Filter to only include real issues (not PRs) that have ALL required labels.
+    // GitHub's issues endpoint returns PRs too; they are the only items with pull_request set.
     const filteredIssues = allIssues.filter(issue => {
+      if (issue.pull_request) return false;
       const issueLabels = issue.labels.map(label =>
         typeof label === 'string' ? label : label.name || ''
       );
@@ -176,6 +178,36 @@ export class GitHubService {
       issue,
       comments,
       associatedPRs,
+    };
+  }
+
+  /**
+   * Creates a new issue in the configured GitHub repository
+   */
+  async createIssue({ title, body, labels }: { title: string; body: string; labels: string[] }): Promise<GitHubIssue> {
+    const { owner, repo } = this.config.github;
+
+    const response = await retry(() =>
+      this.octokit.issues.create({
+        owner,
+        repo,
+        title,
+        body,
+        labels,
+      })
+    );
+
+    const issue = response.data;
+    return {
+      id: issue.id,
+      number: issue.number,
+      title: issue.title,
+      body: issue.body ?? null,
+      state: issue.state as 'open' | 'closed',
+      labels: issue.labels.map(label => typeof label === 'string' ? label : label.name || ''),
+      created_at: issue.created_at,
+      updated_at: issue.updated_at,
+      html_url: issue.html_url,
     };
   }
 }

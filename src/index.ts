@@ -5,6 +5,8 @@ import { LinearService } from './linear.js';
 import { Logger } from './logger.js';
 import { Mutex } from 'async-mutex';
 import type { SyncData } from './types.js';
+import { createLinearIssueFromGitHub, syncCommentsToLinear, updateLinearIssueStatus } from './sync-operations.js';
+import type { LinearIssueData } from './linear.js';
 
 interface SyncResult {
   newIssuesFound: boolean;
@@ -15,149 +17,111 @@ async function sync(): Promise<SyncResult> {
     const config = loadConfig();
     const githubService = new GitHubService(config);
     const linearService = new LinearService(config);
-    const logger = new Logger();
 
-    // Fetch issues with all required labels
-    const issues = await githubService.fetchIssuesWithLabels();
+    console.log('Starting sync with dictionary-based approach...');
+    console.log('='.repeat(80));
 
-    if (issues.length === 0) {
-      console.log('\nNo GitHub issues found matching the specified labels.');
-      return { newIssuesFound: false };
-    }
-
-    // Fetch complete sync data for each issue (use allSettled to continue even if some fail)
-    console.log(`\nFetching details for ${issues.length} issue(s)...`);
-    const syncDataResults = await Promise.allSettled(
-      issues.map(issue => githubService.fetchIssueSyncData(issue))
-    );
-
-    const syncData = syncDataResults
-      .filter((r): r is PromiseFulfilledResult<SyncData> => r.status === 'fulfilled')
-      .map(r => r.value);
-
-    const failedFetches = syncDataResults.filter(r => r.status === 'rejected');
-    if (failedFetches.length > 0) {
-      console.warn(`Warning: Failed to fetch details for ${failedFetches.length} issue(s)`);
-    }
-
-    // Fetch existing Linear issues
-    console.log('\nFetching existing Linear issues...');
+    // Step 1: Fetch all Linear issues with sync label (build dictionary)
+    console.log('\nStep 1: Fetching Linear issues with sync label...');
     const linearIssues = await linearService.fetchSyncedIssues();
-    const existingGitHubNumbers = new Set(
-      linearIssues.map(issue => issue.githubIssueNumber).filter(num => num !== undefined)
+
+    // Build dictionary: GitHub issue number -> Linear issue data
+    const dictionary = new Map<number, LinearIssueData>();
+    for (const issue of linearIssues) {
+      if (issue.githubIssueNumber !== undefined) {
+        dictionary.set(issue.githubIssueNumber, issue);
+      }
+    }
+
+    console.log(`Found ${linearIssues.length} Linear issue(s) with sync label`);
+    console.log(`Dictionary contains ${dictionary.size} issue(s) with GitHub numbers`);
+
+    // Step 2: Fetch all OPEN GitHub issues with configured labels
+    console.log('\nStep 2: Fetching open GitHub issues...');
+    const openGitHubIssues = await githubService.fetchIssuesWithLabels();
+
+    console.log(`Found ${openGitHubIssues.length} open GitHub issue(s) matching labels`);
+
+    // Step 3: Create Linear issues for GitHub issues not in dictionary
+    const newGitHubIssues = openGitHubIssues.filter(
+      issue => !dictionary.has(issue.number)
     );
 
-    console.log(`Found ${linearIssues.length} existing synced issue(s) in Linear`);
-
-    // Determine which issues need to be created
-    const issuesToCreate = syncData.filter(
-      data => !existingGitHubNumbers.has(data.issue.number)
-    );
-
-    console.log(`\n${issuesToCreate.length} new issue(s) to sync to Linear`);
-
-    // Create new issues in Linear and sync comments (with parallel batching)
-    const BATCH_SIZE = 5; // Process 5 issues at a time to avoid overwhelming APIs
+    console.log(`\nStep 3: Creating ${newGitHubIssues.length} new Linear issue(s)...`);
     let createdCount = 0;
 
-    for (let i = 0; i < issuesToCreate.length; i += BATCH_SIZE) {
-      const batch = issuesToCreate.slice(i, i + BATCH_SIZE);
-      console.log(`\nProcessing batch ${Math.floor(i / BATCH_SIZE) + 1} (${batch.length} issue(s))...`);
+    if (newGitHubIssues.length > 0) {
+      const BATCH_SIZE = 5;
+      for (let i = 0; i < newGitHubIssues.length; i += BATCH_SIZE) {
+        const batch = newGitHubIssues.slice(i, i + BATCH_SIZE);
+        console.log(`\nProcessing batch ${Math.floor(i / BATCH_SIZE) + 1} (${batch.length} issue(s))...`);
 
-      // Process batch in parallel using Promise.allSettled
-      const results = await Promise.allSettled(
-        batch.map(async (data) => {
-          let linearIssue: any = null;
+        const results = await Promise.allSettled(
+          batch.map(issue => createLinearIssueFromGitHub(config, issue.number))
+        );
 
-          try {
-            console.log(`  Creating Linear issue for GitHub #${data.issue.number}: ${data.issue.title}`);
-            linearIssue = await linearService.createIssue(data.issue);
-            console.log(`  ✓ Created: ${linearIssue.identifier}`);
-
-            // Sync all comments for new issue
-            if (data.comments.length > 0) {
-              console.log(`    Syncing ${data.comments.length} comment(s)...`);
-              const syncedCount = await linearService.syncComments(linearIssue.id, data.comments);
-              console.log(`    ✓ Synced ${syncedCount} comment(s)`);
-            }
-
-            return { success: true, issue: linearIssue };
-          } catch (error) {
-            // Transaction compensation: if comment syncing failed after issue creation
-            if (linearIssue) {
-              console.error(`  ✗ Failed to sync comments for ${linearIssue.identifier}:`, error);
-              console.error(`    Issue was created but comments failed. Manual review may be needed.`);
-            } else {
-              console.error(`  ✗ Failed to create issue for GitHub #${data.issue.number}:`, error);
-            }
-            return { success: false, error };
+        for (const result of results) {
+          if (result.status === 'fulfilled' && result.value.success && result.value.linearIssue) {
+            // Add to dictionary for step 4
+            dictionary.set(result.value.linearIssue.githubIssueNumber!, result.value.linearIssue);
+            createdCount++;
           }
+        }
+      }
+    }
+
+    // Step 4: Update all Linear issues in dictionary
+    console.log(`\nStep 4: Updating ${dictionary.size} Linear issue(s)...`);
+    let commentsAddedCount = 0;
+    let stateChangedCount = 0;
+
+    // Process in batches for performance
+    const BATCH_SIZE = 5;
+    const dictionaryEntries = Array.from(dictionary.entries());
+
+    for (let i = 0; i < dictionaryEntries.length; i += BATCH_SIZE) {
+      const batch = dictionaryEntries.slice(i, i + BATCH_SIZE);
+
+      const results = await Promise.allSettled(
+        batch.map(async ([githubNumber, linearIssue]) => {
+          console.log(`  Processing ${linearIssue.identifier} (GitHub #${githubNumber})...`);
+
+          // Sync comments
+          const commentResult = await syncCommentsToLinear(config, linearIssue.id, githubNumber);
+          if (commentResult.success && commentResult.addedCount > 0) {
+            console.log(`    ✓ Added ${commentResult.addedCount} new comment(s)`);
+          }
+
+          // Update status
+          const statusResult = await updateLinearIssueStatus(config, linearIssue.id, githubNumber);
+          if (statusResult.success && statusResult.stateChanged) {
+            console.log(`    ✓ Updated state to "${statusResult.newState}"`);
+          }
+
+          return {
+            commentsAdded: commentResult.addedCount,
+            stateChanged: statusResult.stateChanged,
+          };
         })
       );
 
-      // Count successful creations
-      createdCount += results.filter(
-        (r) => r.status === 'fulfilled' && r.value.success
-      ).length;
-    }
-
-    // Sync comments for existing issues
-    const existingIssuesToUpdate = syncData.filter(
-      data => existingGitHubNumbers.has(data.issue.number)
-    );
-
-    if (existingIssuesToUpdate.length > 0) {
-      console.log(`\nChecking ${existingIssuesToUpdate.length} existing issue(s) for new comments...`);
-
-      for (const data of existingIssuesToUpdate) {
-        // Find the Linear issue
-        const linearIssue = linearIssues.find(
-          li => li.githubIssueNumber === data.issue.number
-        );
-
-        if (linearIssue && data.comments.length > 0) {
-          const syncedCount = await linearService.syncComments(linearIssue.id, data.comments);
-          if (syncedCount > 0) {
-            console.log(`  ✓ ${linearIssue.identifier}: Added ${syncedCount} new comment(s)`);
+      // Count results
+      for (const result of results) {
+        if (result.status === 'fulfilled') {
+          commentsAddedCount += result.value.commentsAdded;
+          if (result.value.stateChanged) {
+            stateChangedCount++;
           }
         }
       }
     }
 
-    // Sync states for all issues (new and existing)
-    console.log(`\nSyncing states for ${syncData.length} issue(s)...`);
-    let stateChangedCount = 0;
-
-    for (const data of syncData) {
-      // Find the Linear issue
-      const linearIssue = linearIssues.find(
-        li => li.githubIssueNumber === data.issue.number
-      );
-
-      if (linearIssue) {
-        const stateChanged = await linearService.syncIssueState(
-          linearIssue.id,
-          data.issue,
-          data.associatedPRs
-        );
-
-        if (stateChanged) {
-          stateChangedCount++;
-          const stateName = data.issue.state === 'closed'
-            ? config.linear.stateDone
-            : (data.associatedPRs.some(pr => pr.state === 'open' && !pr.draft)
-                ? config.linear.stateInReview
-                : 'unknown');
-          console.log(`  ✓ ${linearIssue.identifier}: Updated state to "${stateName}"`);
-        }
-      }
-    }
-
-    // Log the results
-    logger.logSyncData(syncData);
-    logger.logSummary(syncData);
-
-    console.log(`\nSync complete: ${createdCount} issue(s) created, ${stateChangedCount} state(s) updated`);
+    console.log('\n' + '='.repeat(80));
+    console.log('Sync complete:');
+    console.log(`  - ${createdCount} new issue(s) created`);
+    console.log(`  - ${commentsAddedCount} comment(s) added`);
+    console.log(`  - ${stateChangedCount} state(s) updated`);
+    console.log('='.repeat(80));
 
     return { newIssuesFound: createdCount > 0 };
   } catch (error) {

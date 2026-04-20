@@ -60,6 +60,49 @@ export class GitHubService {
   }
 
   /**
+   * Fetches a single GitHub issue by number (can be open or closed)
+   */
+  async fetchIssueByNumber(issueNumber: number): Promise<GitHubIssue | null> {
+    const { owner, repo } = this.config.github;
+
+    try {
+      const response = await retry(() =>
+        this.octokit.issues.get({
+          owner,
+          repo,
+          issue_number: issueNumber,
+        })
+      );
+
+      const issue = response.data;
+
+      // Check if it's a PR (we only sync issues)
+      if (issue.pull_request) {
+        return null;
+      }
+
+      return {
+        id: issue.id,
+        number: issue.number,
+        title: issue.title,
+        body: issue.body ?? null,
+        state: issue.state as 'open' | 'closed',
+        labels: issue.labels.map(label => typeof label === 'string' ? label : label.name || ''),
+        created_at: issue.created_at,
+        updated_at: issue.updated_at,
+        html_url: issue.html_url,
+      };
+    } catch (error: any) {
+      // Handle 404 (issue not found or no access)
+      if (error.status === 404) {
+        console.warn(`GitHub issue #${issueNumber} not found or not accessible`);
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  /**
    * Fetches all comments for a specific issue
    */
   async fetchComments(issueNumber: number): Promise<GitHubComment[]> {

@@ -40,7 +40,7 @@ async function main() {
           team: { id: { eq: teamId } },
         },
         first: 100,
-        after: cursor,
+        ...(cursor ? { after: cursor } : {}),
       })
     );
 

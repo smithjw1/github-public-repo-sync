@@ -131,6 +131,70 @@ export class LinearService {
   }
 
   /**
+   * Fetches all issues in the team (including non-synced ones)
+   * Used for duplicate detection across all issues
+   */
+  async fetchAllTeamIssues(): Promise<LinearIssueData[]> {
+    const { teamId } = this.config.linear;
+    const allIssues: LinearIssueData[] = [];
+    let hasNextPage = true;
+    let cursor: string | undefined;
+
+    while (hasNextPage) {
+      const page = await retry(() =>
+        this.client.issues({
+          filter: {
+            team: { id: { eq: teamId } },
+          },
+          first: 100,
+          ...(cursor ? { after: cursor } : {}),
+        })
+      );
+
+      for (const issue of page.nodes) {
+        const description = issue.description ?? undefined;
+        const githubIssueNumber = this.parseGitHubIssueNumber(description);
+        allIssues.push({
+          id: issue.id,
+          identifier: issue.identifier,
+          title: issue.title,
+          description,
+          githubIssueNumber,
+        });
+      }
+
+      hasNextPage = page.pageInfo.hasNextPage;
+      cursor = page.pageInfo.endCursor;
+    }
+
+    return allIssues;
+  }
+
+  /**
+   * Checks if an issue is in a canceled state
+   */
+  async isIssueCanceled(issueId: string): Promise<boolean> {
+    try {
+      const issue = await retry(() => this.client.issue(issueId));
+      const state = await issue.state;
+      return state?.type === 'canceled';
+    } catch (error) {
+      console.error(`Failed to check if issue ${issueId} is canceled:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Finds an issue by title (case-insensitive, trimmed)
+   * Returns undefined if no match found
+   */
+  async findIssueByTitle(title: string): Promise<LinearIssueData | undefined> {
+    const allIssues = await this.fetchAllTeamIssues();
+    const normalizedTitle = title.trim().toLowerCase();
+    return allIssues.find(issue => issue.title.trim().toLowerCase() === normalizedTitle);
+  }
+
+  /**
    * Parses GitHub issue number from Linear issue description
    */
   parseGitHubIssueNumber(description: string | undefined): number | undefined {
@@ -150,13 +214,35 @@ export class LinearService {
   /**
    * Creates a new issue in Linear with GitHub metadata
    * Implements idempotency: returns existing issue if already synced
+   * Also checks for duplicates by title and declined issues
    */
-  async createIssue(githubIssue: GitHubIssue): Promise<LinearIssueData> {
-    // Idempotency check: see if issue already exists
-    const existing = await this.findIssueByGitHubNumber(githubIssue.number);
-    if (existing) {
-      console.log(`  Issue already exists: ${existing.identifier}`);
-      return existing;
+  async createIssue(githubIssue: GitHubIssue): Promise<LinearIssueData | null> {
+    // Check 1: See if issue with same GitHub number already exists (synced issues)
+    const existingByNumber = await this.findIssueByGitHubNumber(githubIssue.number);
+    if (existingByNumber) {
+      console.log(`  ⊘ Skipping GitHub #${githubIssue.number}: Already synced as ${existingByNumber.identifier}`);
+      return null;
+    }
+
+    // Check 2: See if issue with same title already exists (any issue in team)
+    const existingByTitle = await this.findIssueByTitle(githubIssue.title);
+    if (existingByTitle) {
+      console.log(`  ⊘ Skipping GitHub #${githubIssue.number}: Duplicate title found in ${existingByTitle.identifier}`);
+      return null;
+    }
+
+    // Check 3: See if a canceled issue with same GitHub number exists
+    const allIssues = await this.fetchAllTeamIssues();
+    const canceledDuplicate = allIssues.find(
+      issue => issue.githubIssueNumber === githubIssue.number
+    );
+
+    if (canceledDuplicate) {
+      const isCanceled = await this.isIssueCanceled(canceledDuplicate.id);
+      if (isCanceled) {
+        console.log(`  ⊘ Skipping GitHub #${githubIssue.number}: Canceled duplicate found in ${canceledDuplicate.identifier}`);
+        return null;
+      }
     }
 
     const labelId = await this.getOrCreateSyncLabel();
